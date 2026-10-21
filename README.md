@@ -1,6 +1,7 @@
 # AWS – Novatrix AB
 
 **Namn:** Farideh Dehghan
+
 **Kurs:** Amazon Web Services
 
 ## Uppgift 1 (v42) – Compute och kom igång
