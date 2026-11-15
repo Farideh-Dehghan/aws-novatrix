@@ -34,4 +34,29 @@ WordPress för Novatrix AB med hanterad databas, delad fillagring och backup til
 - Skriptet /usr/local/bin/novatrix-backup.sh gör mysqldump av databasen och tar av wp-content, och laddar upp båda till S3
 - Cron kör skriptet varje natt kl. 02:00
 - Lifecycle-regeln novatrix-backup-14d tar bort backuper under backups/ efter 14 dagar
+## Uppgift 5 (v46) – IaC med CloudFormation
+
+Hela WordPress-stacken för Novatrix AB är skriven som kod i tre CloudFormation-templates. Stackarna läser varandras värden med Export och !ImportValue.
+
+| Template | Stack | Innehåll |
+|---|---|---|
+| natverk.yaml | novatrix46-natverk | VPC, ett publikt och två privata subnät, internet gateway, route table, NACL, security groups för webb, databas och EFS |
+| data.yaml | novatrix46-data | RDS MariaDB (privat, krypterad), lösenord genererat i Secrets Manager, EFS med mount targets i två AZ |
+| webb.yaml | novatrix46-webb | IAM-roll och instance profile, EC2 som installerar Apache, PHP och WordPress och monterar EFS via user data |
+
+**Parametrar:** Prefix (namn på alla resurser), MyIp (SSH bara från min dator), DbInstanceClass, InstanceType, KeyName, DataBucket och BackupBucket. Inga lösenord finns i repot.
+
+### Återskapa stacken från repot
+1. Klona repot: `git clone https://github.com/Farideh-Dehghan/aws-novatrix.git`
+2. Validera: `aws cloudformation validate-template --template-body file://natverk.yaml`
+3. Skapa stackarna i ordning (CloudFormation → Create stack → Upload a template file):
+   - `natverk.yaml` som `novatrix46-natverk`, ange MyIp
+   - `data.yaml` som `novatrix46-data` (tar ca 10 minuter för RDS)
+   - `webb.yaml` som `novatrix46-webb`, ange KeyName och buckets, kryssa i IAM-capability
+4. Öppna WebUrl från webb-stackens Outputs. Database Host är DbEndpoint från data-stacken, lösenordet hämtas i Secrets Manager.
+5. Riv i omvänd ordning: webb, data, natverk.
+
+### Versionshantering
+Ändringen "v46: add Course tag to VPC" lade till en tagg i natverk.yaml. Stacken uppdaterades med Update stack, och change set visade en enda ändring: Modify på Vpc med Replacement False. Historiken i Git visar vem som ändrade vad och när. Det gör att man kan granska ändringar innan de körs, gå tillbaka till en tidigare version om något går fel, och arbeta flera personer i samma kod utan manuella klick i konsolen.
+
 
