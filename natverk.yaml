@@ -26,7 +26,9 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${Prefix}-vpc
-
+        # v46 change 2: course tag, shows an update without replacement
+        - Key: Course
+          Value: MOV25
   PublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
