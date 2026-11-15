@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Novatrix data layer (v45 as code). Needs the network stack. Stack name: novatrix46-data.
+  RDS MariaDB in the private subnets with a generated password in Secrets Manager,
+  and an encrypted EFS with one mount target per private subnet.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: novatrix46
+    AllowedPattern: "[a-z][a-z0-9-]*"
+    Description: Same prefix as the network stack
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small]
+
+Resources:
+  # Step 9: subnet group, generated password and the database
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub ${Prefix}-db-subnets
+      DBSubnetGroupDescription: Private subnets for the Novatrix database
+      SubnetIds:
+        - !ImportValue {"Fn::Sub": "${Prefix}-private-a-id"}
+        - !ImportValue {"Fn::Sub": "${Prefix}-private-b-id"}
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub Admin password for ${Prefix}-db
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub ${Prefix}-db
+      Engine: mariadb
+      EngineVersion: "11.4"
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      MasterUsername: admin
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      DBName: wordpress
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue {"Fn::Sub": "${Prefix}-db-sg-id"}
+      PubliclyAccessible: false
+      MultiAZ: false
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      DeleteAutomatedBackups: true
+
+  # Step 10: EFS with one mount target per private subnet
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ${Prefix}-efs
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !ImportValue {"Fn::Sub": "${Prefix}-private-a-id"}
+      SecurityGroups:
+        - !ImportValue {"Fn::Sub": "${Prefix}-efs-sg-id"}
+
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !ImportValue {"Fn::Sub": "${Prefix}-private-b-id"}
+      SecurityGroups:
+        - !ImportValue {"Fn::Sub": "${Prefix}-efs-sg-id"}
+
+Outputs:
+  DbSecretArn:
+    Value: !Ref DbSecret
+    Export: {Name: !Sub "${Prefix}-db-secret-arn"}
+  DbEndpoint:
+    Description: Database Host in the WordPress installer
+    Value: !GetAtt Database.Endpoint.Address
+    Export: {Name: !Sub "${Prefix}-db-endpoint"}
+  FileSystemId:
+    Value: !Ref FileSystem
+    Export: {Name: !Sub "${Prefix}-efs-id"}
