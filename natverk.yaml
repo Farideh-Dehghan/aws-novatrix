@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Novatrix network layer (v44 as code). Stack name: novatrix46-natverk.
+  Novatrix network layer (v44 as code, v47 adds public-b and the ALB group). Stack name: novatrix46-natverk.
   VPC with one public and two private subnets, internet gateway, NACL for the
   public subnet and security groups for web, database and EFS.
 
@@ -29,6 +29,7 @@ Resources:
         # v46 change 2: course tag, shows an update without replacement
         - Key: Course
           Value: MOV25
+
   PublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
@@ -39,6 +40,18 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${Prefix}-public
+
+  # v47: a second public subnet, the load balancer needs two Availability Zones
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Prefix}-public-b
 
   PrivateSubnetA:
     Type: AWS::EC2::Subnet
@@ -96,6 +109,12 @@ Resources:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
 
+  PublicSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
   # Step 7: the NACL for the public subnet (stateless, so return traffic needs its own rules)
   PublicNacl:
     Type: AWS::EC2::NetworkAcl
@@ -140,6 +159,12 @@ Resources:
       SubnetId: !Ref PublicSubnet
       NetworkAclId: !Ref PublicNacl
 
+  PublicSubnetBNacl:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      NetworkAclId: !Ref PublicNacl
+
   # Step 8: security groups, the database and EFS only accept traffic from the web group
   WebSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -151,6 +176,16 @@ Resources:
         - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
         - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
         - {IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref MyIp}
+
+  # v47: the load balancer takes HTTP from everyone
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Prefix}-alb-sg
+      GroupDescription: HTTP from everyone to the load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
 
   DbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -178,6 +213,12 @@ Outputs:
   PublicSubnetId:
     Value: !Ref PublicSubnet
     Export: {Name: !Sub "${Prefix}-public-subnet-id"}
+  PublicSubnetBId:
+    Value: !Ref PublicSubnetB
+    Export: {Name: !Sub "${Prefix}-public-b-subnet-id"}
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export: {Name: !Sub "${Prefix}-alb-sg-id"}
   PrivateSubnetAId:
     Value: !Ref PrivateSubnetA
     Export: {Name: !Sub "${Prefix}-private-a-id"}

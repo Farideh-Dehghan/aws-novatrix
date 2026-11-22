@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Novatrix scaling layer (v47 as code). Stack name: novatrix46-skala.
+  Application Load Balancer in two public subnets, a launch template that starts
+  identical WordPress servers, an Auto Scaling group over two Availability Zones and a
+  target tracking policy on average CPU. Needs the network and data stacks.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: novatrix46
+    AllowedPattern: "[a-z][a-z0-9-]*"
+    Description: Same prefix as the network and data stacks
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing key pair for SSH (used for the load test)
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+  MinSize:
+    Type: Number
+    Default: 2
+  MaxSize:
+    Type: Number
+    Default: 4
+  CpuTarget:
+    Type: Number
+    Default: 50
+    Description: Average CPU in percent that the group tries to keep
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # Load balancer, target group and listener (from the starter)
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${Prefix}-alb
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !ImportValue {"Fn::Sub": "${Prefix}-public-subnet-id"}
+        - !ImportValue {"Fn::Sub": "${Prefix}-public-b-subnet-id"}
+      SecurityGroups:
+        - !ImportValue {"Fn::Sub": "${Prefix}-alb-sg-id"}
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${Prefix}-web-tg
+      VpcId: !ImportValue {"Fn::Sub": "${Prefix}-vpc-id"}
+      Protocol: HTTP
+      Port: 80
+      HealthCheckPath: /wp-login.php
+      Matcher: {HttpCode: "200"}
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: "30"}
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+
+  # Shared keys for WordPress cookies, the same on every server so a login works
+  # whichever server the load balancer picks
+  SaltSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub WordPress keys and salts for ${Prefix}
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # Role for the servers in the group: read the two secrets, nothing else
+  AsgRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-wordpress-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !ImportValue {"Fn::Sub": "${Prefix}-db-secret-arn"}
+                  - !Ref SaltSecret
+  AsgInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AsgRole]
+
+  # Every new server is started from this template and configures itself
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${Prefix}-web-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile: {Arn: !GetAtt AsgInstanceProfile.Arn}
+        SecurityGroupIds:
+          - !ImportValue {"Fn::Sub": "${Prefix}-web-sg-id"}
+        MetadataOptions: {HttpTokens: required}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - {Key: Name, Value: !Sub "${Prefix}-asg-web"}
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              # Runs once at first boot. Log: /var/log/cloud-init-output.log
+              set -euxo pipefail
+              dnf install -y httpd php php-mysqlnd php-gd php-mbstring php-xml amazon-efs-utils
+
+              # Shared wp-content on EFS, also after a reboot
+              mkdir -p /var/www/html/wp-content
+              echo "${EfsId}:/ /var/www/html/wp-content efs _netdev,noresvport,tls 0 0" >> /etc/fstab
+              for i in 1 2 3 4 5 6 7 8 9 10; do mount -a && mountpoint -q /var/www/html/wp-content && break; sleep 15; done
+              mountpoint -q /var/www/html/wp-content
+
+              # WordPress core. -n keeps the files that already are on EFS
+              cd /tmp
+              curl -sSLo latest.tar.gz https://wordpress.org/latest.tar.gz
+              tar -xzf latest.tar.gz
+              cp -rn /tmp/wordpress/. /var/www/html/
+
+              # wp-config.php is written at boot, the secrets come from Secrets Manager
+              DB_PASS=$(aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${DbSecretArn} \
+                --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+              SALT=$(aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${SaltSecret} \
+                --query SecretString --output text)
+              CFG=/var/www/html/wp-config.php
+              cat > $CFG <<EOC
+              <?php
+              define('DB_NAME', 'wordpress');
+              define('DB_USER', 'admin');
+              define('DB_PASSWORD', '$DB_PASS');
+              define('DB_HOST', '${DbHost}');
+              define('DB_CHARSET', 'utf8mb4');
+              define('DB_COLLATE', '');
+              EOC
+              for k in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
+                echo "define('$k', '$SALT-$k');" >> $CFG
+              done
+              cat >> $CFG <<'EOC'
+              // The address follows the Host header, so the site works behind the load balancer
+              if (!empty($_SERVER['HTTP_HOST'])) {
+                define('WP_HOME', 'http://' . $_SERVER['HTTP_HOST']);
+                define('WP_SITEURL', 'http://' . $_SERVER['HTTP_HOST']);
+              }
+              $table_prefix = 'wp_';
+              define('WP_DEBUG', false);
+              if (!defined('ABSPATH')) { define('ABSPATH', __DIR__ . '/'); }
+              require_once ABSPATH . 'wp-settings.php';
+              EOC
+              chmod 640 $CFG
+
+              chown -R apache:apache /var/www/html
+              systemctl enable --now php-fpm httpd
+            - EfsId: !ImportValue {"Fn::Sub": "${Prefix}-efs-id"}
+              DbHost: !ImportValue {"Fn::Sub": "${Prefix}-db-endpoint"}
+              DbSecretArn: !ImportValue {"Fn::Sub": "${Prefix}-db-secret-arn"}
+
+  # The group keeps at least two servers, one per Availability Zone, and replaces
+  # servers that fail the load balancer health check
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${Prefix}-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref MinSize
+      VPCZoneIdentifier:
+        - !ImportValue {"Fn::Sub": "${Prefix}-public-subnet-id"}
+        - !ImportValue {"Fn::Sub": "${Prefix}-public-b-subnet-id"}
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 420
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-asg-web", PropagateAtLaunch: true}
+
+  # Add servers when the average CPU is above the target, remove them when it drops
+  CpuPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 300
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CpuTarget
+
+Outputs:
+  SiteUrl:
+    Description: Open this, the load balancer spreads the traffic over the group
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
