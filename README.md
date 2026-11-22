@@ -60,3 +60,31 @@ Hela WordPress-stacken för Novatrix AB är skriven som kod i tre CloudFormation
 Ändringen "v46: add Course tag to VPC" lade till en tagg i natverk.yaml. Stacken uppdaterades med Update stack, och change set visade en enda ändring: Modify på Vpc med Replacement False. Historiken i Git visar vem som ändrade vad och när. Det gör att man kan granska ändringar innan de körs, gå tillbaka till en tidigare version om något går fel, och arbeta flera personer i samma kod utan manuella klick i konsolen.
 
 
+## Uppgift 6 (v47) – Skalbarhet och tillgänglighet
+
+WordPress-stacken körs nu bakom en Application Load Balancer med en Auto Scaling-grupp över två tillgänglighetszoner. Allt är byggt som kod.
+
+| Fil | Stack | Innehåll |
+|---|---|---|
+| natverk.yaml | novatrix46-natverk | Uppdaterad: andra publika subnätet (public-b, 10.0.3.0/24) och security group för ALB |
+| skala.yaml | novatrix46-skala | ALB, target group med health check på /wp-login.php, launch template, Auto Scaling-grupp (min 2, max 4) och target tracking på 50 % CPU |
+| lasttest.sh | – | Belastar CPU i 15 minuter för att testa skalningen |
+
+Nya servrar konfigurerar sig själva vid start: de monterar EFS, hämtar databaslösenordet från Secrets Manager och skriver wp-config.php. Inga lösenord finns i repot.
+
+### Test av tillgänglighet
+En server terminerades manuellt. Sajten svarade hela tiden via den andra servern, och Auto Scaling startade en ersättare inom en sekund ("unhealthy instance needing to be replaced").
+
+### Test av skalning
+lasttest.sh kördes på båda servrarna. AlarmHigh ökade gruppen från 2 till 3 och sedan 4 servrar. När lasten tog slut minskade AlarmLow gruppen tillbaka till 2.
+
+### Kostnad (AWS Pricing Calculator, eu-north-1, On-Demand, utan Free Tier)
+| | Normal last (2 servrar) | Utskalat (4 servrar) |
+|---|---|---|
+| EC2 t3.micro | 17,11 USD | 34,22 USD |
+| Application Load Balancer | 17,49 USD | 17,49 USD |
+| RDS MariaDB db.t3.micro, Single-AZ, 20 GB | 33,06 USD | 33,06 USD |
+| EFS 1 GB | 0,30 USD | 0,30 USD |
+| **Per månad** | **67,96 USD** | **85,07 USD** |
+
+Skalningen påverkar bara EC2-delen, så kostnaden ökar ungefär 25 % vid full last. Med Savings Plans eller reserverade instanser skulle EC2 och RDS bli upp till cirka 60–70 % billigare för en fast baslast.
